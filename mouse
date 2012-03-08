@@ -1,0 +1,48 @@
+#!/bin/bash
+# sample bash xterm mouse code
+# scott nicholas. nov 2011
+
+exit_func() {
+	printf '\e[?1000l'
+}
+
+mouse_tracking() {
+	local button x y b
+
+	#convert char->dec
+	printf -v button '%d' "'${1:0:1}"
+	printf -v y '%d' "'${1:1:1}"
+	printf -v x '%d' "'${1:2:1}"
+
+	#silly button bits
+	((button&4)) && b+='shift+'
+	((button&8)) && b+='meta+'
+	((button&16)) && b+='ctrl+'
+	case "$(( ((64 & button) >> 4) | (button & 3) ))" in
+		0) b+='button1';;
+		1) b+='button2';;
+		2) b+='button3';;
+		3) b+='release';;
+		4) b+='wheel-up';;
+		5) b+='wheel-down';;
+	esac
+
+	((x-=33,y-=33))
+	printf '%15s (%d,%d)\n' "$b" "$x" "$y"
+#	tput cup $x $y
+#	printf 'X'
+}
+
+trap exit_func EXIT
+
+#enable vt200 mouse reporting
+printf '\e[?1000h'
+tput clear
+
+while :; do
+	read -s -N 6 ch
+
+	case "$ch" in
+		$'\e''[M'*) mouse_tracking "${ch:3}";;
+	esac
+done

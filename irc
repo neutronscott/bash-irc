@@ -1,0 +1,525 @@
+#!/bin/bash
+# irssi-like irc client written in bash4.
+# Copyright (C) 2011 Scott Nicholas <http://scottn.us>
+
+: << EOF	# software license:
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+EOF
+
+# config
+bgcolor=4	#blue
+nickname='mute-bash'
+server='chat.us.freenode.net'
+channels=('#coredump')
+fifo="fifo.$$"
+
+# globals. no touch, k?
+irc=
+curnick=
+curwin=0
+edit_pos=0
+tput_external=0
+tput_internal=0
+window=("status")
+declare -A window_by_name=([status]=0) names_synced=()
+
+#####################
+### irc functions ###
+#####################
+irc_send() {
+	printf '%s\r\n' "$1" >&"$irc"
+}
+
+irc_connect() {
+	local host=$1 port=6667 chan
+
+	[[ $2 ]] && port=$2
+	exec {irc}<>"/dev/tcp/$host/$port"
+	irc_send "NICK $nickname"
+	irc_send "USER $nickname user host :bash-irc user."
+	for chan in "${channels[@]}"; do
+		irc_send "JOIN $chan"
+	done
+}
+
+irc_proc() {
+	local nick user host src cmd dest params line=$1
+
+	if [[ $line = :* ]]; then
+		read -r src cmd dest params <<<"${line:1}"
+		nick="${src%%!*}"
+		user="${src#*!}"
+		user="${user%%@*}"
+		host="${src##*@}"
+	else
+		read -r cmd dest params <<<"$line"
+	fi
+
+	# :(
+	[[ $dest = :* ]] && dest="${dest#?}"
+	[[ $params = :* ]] && params="${params#?}"
+
+	case "$cmd" in
+		PING)		irc_send "PONG $dest";;
+		PRIVMSG)	m_privmsg "$nick" "$user" "$host" "$dest" "$params";;
+		NOTICE)		m_notice "$nick" "$user" "$host" "$dest" "$params";;
+		001)		curnick=$dest;update_status_bar;;
+		#useless noise
+		002|003|004|005|251|252|253|254|255|265|266|250|375|372|376|332|333)
+				;;	#do nothing
+		353)		m_names "${params#* }";;	#names
+		366)		m_366 "${params%% *}";;		#end of names
+		MODE)		;;
+		???)		write "$dest" "<<< [$cmd] $dest $params";;
+		QUIT)		m_quit "$nick" "$user" "$host" "$dest $params";;
+		JOIN)		m_join "$nick" "$user" "$host" "$dest";;
+		PART)		m_part "$nick" "$user" "$host" "$dest";;
+		NICK)		m_nick "$nick" "$user" "$host" "$dest";;
+		*)		write "$dest" "<<< $line";;
+	esac
+}
+
+# End of /NAMES
+m_366() {
+	local dest=$1
+
+	[[ ${names_synced[$dest]} = 1 ]] && return
+	names_synced[$dest]=1
+	c_scan "$dest"
+}
+
+m_names() {
+	local dest=${1%% *} nicks=${1#*:} win=cur
+
+	[[ names_synced[$dest] = 1 ]] && return
+	[[ ${window_by_name[$dest]} ]] && win=${window_by_name[$dest]}
+
+	for nick in $nicks; do
+		[[ $nick = [@+%\&]* ]] && nick=${nick#?}	#ops,etc?
+		eval 'names_'$win'+=("$nick")'
+	done
+}
+
+m_nick() {
+	local nick=$1 user=$2 host=$3 newnick=$4
+
+	if [[ $nick = $curnick ]]; then
+		curnick=$newnick
+		write cur "*** You are now known as $newnick"
+	else
+		write cur "*** $nick [$user@$host] is now known as $newnick"
+	fi
+}
+
+m_join() {
+	local nick=$1 user=$2 host=$3 dest=$4
+
+	if [[ $nick = $curnick ]]; then
+		window_create "$dest"
+		window_select "${window_by_name[$dest]}"
+	fi
+	write "$dest" "*** $nick [$user@$host] has joined $dest"
+}
+
+m_part() {
+	local nick=$1 user=$2 host=$3 dest=$4
+	local next=
+
+	if [[ $nick = $curnick ]]; then
+		window_destory "$dest"
+	else
+		write "$dest" "*** $nick [$user@$host] has left $dest"
+	fi
+}
+
+m_quit() {
+	local nick=$1 user=$2 host=$3 msg="${4% }"
+
+	# fixme: need nickname list per channel, iterate, show in each chan
+	write cur "*** $nick [$user@$host] has quit [$msg]"
+}
+
+m_notice() {
+	local nick=$1 user=$2 host=$3 dest=$4 msg=$5
+
+	write "$dest" "-$nick- $msg"
+}
+
+m_privmsg() {
+	local nick=$1 user=$2 host=$3 dest=$4 msg=$5
+
+	[[ $msg == * ]] && { m_ctcp "$nick" "$user" "$host" "$dest" "$msg"; return 0; }
+	[[ $dest = $curnick ]] && dest=$nick
+	write "$dest" "<$nick> $msg"
+}
+
+m_ctcp() {
+	local nick=$1 user=$2 host=$3 dest=$4 msg
+
+	msg="${5##}"
+	msg="${msg%%}"
+	read -r cmd msg <<< "$msg"
+
+	[[ $dest = $curnick ]] && dest=$nick
+	[[ $cmd = ACTION ]] || write "$dest" "*** $nick requests CTCP [$cmd] $msg"
+	case "$cmd" in
+		ACTION)		write "$dest" "* $nick $msg";;
+		PING)		irc_send "NOTICE $1 :PING $msg";;
+		VERSION)	irc_send "NOTICE $1 :VERSION bash-irc...!";;
+	esac
+}
+
+########################
+### window functions ###
+########################
+# major time saver
+tput_init() {
+	local c vt100_cup=$'\033''[6;6H' vt100_csr=$'\033''[6;6r'
+
+	for c in civis clear cnorm el ind reset "setab $bgcolor" sgr0; do
+		v=${c%% *}
+		eval 'tput_'$v'=$(command tput $c && echo 'EOF')'
+		eval 'tput_'$v'=${tput_'$v'%EOF}'
+	done
+	[[ $(tput cup 5 5) = $vt100_cup ]] && tput_internal_cup=1
+	[[ $(tput csr 5 5) = $vt100_csr ]] && tput_internal_csr=1
+}
+
+tput() {
+	case "$1" in
+		civis|clear|cnorm|el|ind|reset|setab|sgr0)
+			((tput_internal++))
+			eval 'printf "%s" "$tput_'$1'"';;
+		cup)
+			if ((tput_internal_cup)); then
+				((tput_internal++))
+				printf '\033[%d;%dH' $(($2+1)) $(($3+1))
+			else
+				((tput_external++))
+				command tput "$@"
+			fi
+			;;
+		csr)
+			if ((tput_internal_csr)); then
+				((tput_internal++))
+				printf '\033[%d;%dr' $(($2+1)) $(($3+1))
+			else
+				((tput_external++))
+				command tput "$@"
+			fi
+			;;
+		*)	((tput_external++)); command tput "$@";;
+	esac
+}
+
+window_create() {
+	local dest=$1 win
+
+	window+=("$dest")
+	names_synced[$dest]=0
+	#now find it... o.O
+	for win in "${!window[@]}"; do
+		if [[ ${window[win]} = $dest ]]; then
+			window_by_name[$dest]=$win
+			break
+		fi
+	done
+}
+
+window_destory() {
+	local dest=$1 win=$1 i j
+
+	c_window_next
+
+	[[ $dest = [[:digit:]]* ]] || win=${window_by_name[$dest]}
+
+	unset window_by_name[$dest]
+	unset names_synced[$dest]
+
+	#renumber all the indexs, ewww?
+	for ((i = win, j = win + 1; i < ${#window[@]}; i++, j++)); do
+#		[[ ${window[i]} ]] || ((j++))
+		if [[ ${window[@]:j:1} ]]; then
+			window[i]=${window[@]:j:1}
+			eval 'buffer_'$i'=${buffer_'$j'[@]}'
+			eval 'names_'$i'=${names_'$j'[@]}'
+			window_by_name[${window[i]}]=$i
+		else
+			unset window[i]
+			eval 'unset names_'$i
+			eval 'unset buffer_'$i
+		fi
+	done
+}
+
+#omgomg
+window_redraw() {
+	local buf
+
+	tput civis
+	lines=$(tput lines)
+	cols=$(tput cols)
+	status=$((lines - 2))
+	edit=$((lines - 1))
+	curline=1
+	tput sgr0
+	tput clear
+	tput csr 1 $((status-1))	# scroll area
+	update_title_bar
+
+	# redisplay buffer
+	eval 'len=${#buffer_'$curwin'[@]}'
+	((len>lines)) && len=$lines
+	eval 'for buf in "${buffer_'$curwin'[@]:0-len}"; do
+		write cur "$buf" n
+	done'
+	update_status_bar
+	# always stay at edit line
+	tput cup $edit 0
+	tput el
+	printf '[%s] %s' "${window[curwin]}" "$edit_line"
+	tput cnorm
+}
+
+#fixme: erase using background color
+update_title_bar() {
+	tput cup 0 0
+	tput setab $bgcolor
+	printf '%*s' "-$cols" "debug stuff: term:${cols}x${lines} curline:$curline edit_pos:$edit_pos tput in:$tput_internal ext:$tput_external"
+	tput sgr0
+}
+
+#fixme: erase using background color
+update_status_bar() {
+	local statusbar i=1
+
+	tput cup $status 0
+	tput setab $bgcolor
+
+	statusbar="[$curnick]"
+	for k in "${!window[@]}"; do
+		statusbar+=" [$i:${window[k]}]"
+		[[ $curwin = $k ]] && statusbar+='*'
+		((i++))
+	done
+	printf '%*s' "-$cols" "$statusbar"
+	tput sgr0
+}
+
+window_select() {
+	curwin=$1
+	window_redraw
+}
+
+# split in two functions... write_line/write_screen(less cups!)
+write() {
+	local dest=$1 line=$2 nobuffer=$3 win=$curwin k printed
+
+	#improperly destined messages goto curwin
+	[[ ${window_by_name[$dest]} ]] && win=${window_by_name[$dest]}
+	[[ $nobuffer ]] || eval 'buffer_'$win'+=("$line")'
+
+	# it's added to buffer now, if not on curwin, we're done.
+	[[ $win = $curwin ]] || return
+
+	#invisible cursor
+	tput civis
+	if ((curline==status)); then
+		tput cup $((curline-1)) 0
+		tput ind	#scroll
+	else
+		tput cup $((curline++)) 0
+		tput el
+	fi
+
+	#wordwrap, kinda
+	for ((printed=0; printed < (${#line}-cols); printed+=cols)); do
+		printf '%s\n' "${line:printed:cols}"
+		((curline++))
+	done
+	#but final line has no \n
+	printf '%s' "${line:printed:cols}"
+
+	update_title_bar
+	update_status_bar
+	#always go back to edit line
+	tput cup $edit $((edit_pos + ${#window[curwin]} + 3))
+	tput cnorm	#cursor visible
+}
+
+#######################
+### input functions ###
+#######################
+input_cmd() {
+	local cmd params
+
+	read cmd params <<<"$1"
+
+	case "$cmd" in
+		exit)	exit;;
+		quit)	irc_send "QUIT :$params"; sleep 1; exit;;
+		join)	irc_send "JOIN :$params";;
+		part)	irc_send "PART :$params";;
+		nick)	irc_send "NICK :$params";;
+		query)	c_query "$params";;
+		quote)	irc_send "$params";;
+		sc)	c_scan;;
+		wins)	c_list_windows;;
+		*)	write cur "*** Unknown command: $cmd";;
+	esac
+}
+
+c_list_windows() {
+	for win in "${!window[@]}"; do
+		eval 'write cur "*** Window $win: ${window[win]} buf: ${#buffer_'$win'[@]}"'
+	done
+}
+
+c_scan() {
+	local nick i=0 line="  " dest=$1 win=$curwin
+
+	[[ $dest ]] && win=${window_by_name[$dest]}
+	write "${window[win]}" "[Users ${window[win]}]"
+	eval 'for nick in "${names_'$win'[@]}"; do
+		line+="[$nick] "
+		if (((++i % 5) == 0)); then
+			write "${window[win]}" "$line"
+			line=
+		fi
+	done'
+
+	((${#line} > 0)) && write "${window[win]}" "$line"
+	eval 'write "${window[win]}" "${window[win]}: Total of ${#names_'$win'[@]} nicks"'
+}
+
+c_query() {
+	local dest=$1
+
+	window_create "$dest"
+	window_select "${window_by_name[$dest]}"
+}
+
+c_window_next() {
+	local k next
+	for k in "${!window[@]}" "${!window[@]}"; do
+		[[ $next = 1 ]] && {
+			window_select "$k"
+			break
+		}
+		[[ $curwin = $k ]] && next=1
+	done
+}
+
+input_proc() {
+	local ch="$1"
+
+	if ((${#ch} == 0)); then	#newline is eatten mooo
+		#erase edit box
+		edit_pos=0
+		tput cup $edit $((edit_pos + ${#window[curwin]} + 3))
+		tput el
+
+		if [[ $edit_line == /* ]]; then
+			input_cmd "${edit_line:1}"
+		else
+			if [[ ${window[curwin]} = status ]]; then
+				write status "echo: $edit_line"
+			else
+				write "${window[curwin]}" "<$curnick> $edit_line"
+				irc_send "PRIVMSG ${window[curwin]} :$edit_line"
+			fi
+		fi
+		edit_line=
+	else
+		case "$ch" in
+		$'\x7f')	((edit_pos>0)) && ((edit_pos--))
+				tput cup $edit $((edit_pos + ${#window[curwin]} + 3))
+				tput el
+				edit_line="${edit_line%?}"
+				;;
+		$'\xc')		window_redraw;;
+		$'\x18')	c_window_next;;
+		[[:print:]])	((edit_pos++))
+			edit_line+=$ch
+			#we should always have cursor at editbox...
+			printf '%c' "$ch"
+			;;
+		esac
+	fi
+}
+
+############
+### main ###
+############
+exit_trap() {
+	rm "$fifo"
+	tput reset
+	#buh bye kids
+	echo "Thanks for trying..."
+	kill -SIGTERM 0
+}
+
+thread_user() {
+	local ch
+
+	while IFS= read -s -N 1 -r ch; do
+		echo "U$ch"
+	done
+} >&3
+
+thread_server() {
+	local line
+
+	while IFS= read -u "$irc" -r line; do
+		line="${line%$'\n'}"
+		line="${line%$'\r'}"
+		echo "S$line"
+	done
+} >&3
+
+main() {
+	local retval=0 line
+
+	trap exit_trap EXIT
+	trap window_redraw SIGWINCH
+
+	mkfifo "$fifo" || {
+		echo "Unable to create FIFO '$fifo'" >&2
+		exit
+	}
+	# fd3=fifo, move stdin to fd4
+	exec 3<>"$fifo" 4<&0 0<&-
+
+	window_redraw
+	thread_user <&4 &	#give stdin to user thread.
+
+	write cur "*** Connecting to ${server}:${port}..."
+	irc_connect "$server" "$port"
+	write cur "*** Connected FD $irc"
+	thread_server 4<&- &	#no stdin
+
+	while IFS= read -r -u 3 line; do
+		thread=${line:0:1}
+		line=${line#?}
+		case "$thread" in
+			S) irc_proc "$line";;
+			U) input_proc "$line";;
+		esac
+	done
+}
+
+tput_init
+[[ $1 ]] && server=$1
+[[ $2 ]] && port=$2
+main

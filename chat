@@ -1,0 +1,83 @@
+#!/bin/bash
+
+# 4=blue
+bgcolor=4
+statusbar="[nickname] [#channel]"
+
+exit_trap() {
+	tput reset
+	stty "$stty_saved"
+}
+
+trap exit_trap EXIT
+trap update_window SIGWINCH
+
+proc_cmd() {
+	exit
+}
+
+update_window() {
+	lines=$(tput lines)
+	cols=$(tput cols)
+	status=$((lines - 2))
+	edit=$((lines - 1))
+	curline=1
+	tput sgr0
+	tput clear
+	tput csr 1 $((status-1))	# scroll area
+	update_title_bar
+	update_status_bar
+	tput cup $edit 0
+	tput el
+}
+
+update_title_bar() {
+	tput cup 0 0
+	tput setab $bgcolor
+	printf '%*s' "-$cols" "[#channel]: status $status edit $edit curline $curline"
+	tput sgr0
+}
+
+update_status_bar() {
+	tput cup $status 0
+	tput setab $bgcolor
+	printf '%*s' "-$cols" "$statusbar"
+	tput sgr0
+}
+
+proc_inputline() {
+	if [ "${line:0:1}" = "/" ]; then
+		proc_cmd
+	fi
+
+	if ((curline==status)); then
+		tput cup $((curline-1)) 0
+		tput ind
+	else
+		tput cup $((curline++)) 0
+		tput el
+	fi
+	printf '%s' "$line"
+
+	update_title_bar
+}
+
+read_input() {
+	IFS= read -r line
+
+	tput cup $edit 0
+	tput el
+
+	proc_inputline "$line"
+}
+
+# terminal setup
+stty_saved=$(stty -g)
+#stty raw
+
+update_window
+
+while true; do
+	tput cup $edit 0
+	read_input
+done
