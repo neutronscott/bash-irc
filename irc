@@ -21,6 +21,7 @@ EOF
 bgcolor=4	#blue
 nickname='mute-bash'
 server='chat.us.freenode.net'
+port=6667
 channels=('#coredump')
 fifo="fifo.$$"
 
@@ -45,7 +46,7 @@ irc_connect() {
 	local host=$1 port=6667 chan
 
 	[[ $2 ]] && port=$2
-	exec {irc}<>"/dev/tcp/$host/$port"
+	exec {irc}<>"/dev/tcp/$host/$port" || exit
 	irc_send "NICK $nickname"
 	irc_send "USER $nickname user host :bash-irc user."
 	for chan in "${channels[@]}"; do
@@ -137,7 +138,7 @@ m_part() {
 	local next=
 
 	if [[ $nick = $curnick ]]; then
-		window_destory "$dest"
+		window_destroy "$dest"
 	else
 		write "$dest" "*** $nick [$user@$host] has left $dest"
 	fi
@@ -237,7 +238,7 @@ window_create() {
 	done
 }
 
-window_destory() {
+window_destroy() {
 	local dest=$1 win=$1 i j
 
 	c_window_next
@@ -424,7 +425,16 @@ c_window_next() {
 input_proc() {
 	local ch="$1"
 
-	if ((${#ch} == 0)); then	#newline is eatten mooo
+	case "$ch" in
+	'C-?')	# backspace
+		((edit_pos>0)) && ((edit_pos--))
+		tput cup $edit $((edit_pos + ${#window[curwin]} + 3))
+		tput el
+		edit_line="${edit_line%?}"
+		;;
+	C-l)	window_redraw;;
+	C-x)	c_window_next;;
+	C-j)	# end of the line... soo much to do
 		#erase edit box
 		edit_pos=0
 		tput cup $edit $((edit_pos + ${#window[curwin]} + 3))
@@ -441,22 +451,14 @@ input_proc() {
 			fi
 		fi
 		edit_line=
-	else
-		case "$ch" in
-		$'\x7f')	((edit_pos>0)) && ((edit_pos--))
-				tput cup $edit $((edit_pos + ${#window[curwin]} + 3))
-				tput el
-				edit_line="${edit_line%?}"
-				;;
-		$'\xc')		window_redraw;;
-		$'\x18')	c_window_next;;
-		[[:print:]])	((edit_pos++))
-			edit_line+=$ch
-			#we should always have cursor at editbox...
-			printf '%c' "$ch"
-			;;
-		esac
-	fi
+		;;
+	*)	# something normal?
+		((edit_pos+=${#ch}))
+		edit_line+=$ch
+		#we should always have cursor at editbox...
+		printf '%s' "$ch"
+		;;
+	esac
 }
 
 ############
@@ -464,17 +466,157 @@ input_proc() {
 ############
 exit_trap() {
 	rm "$fifo"
-	tput reset
 	#buh bye kids
+	reset
 	echo "Thanks for trying..."
 	kill -SIGTERM 0
+}
+
+declare -A key_bindings=(
+	["C-["]="meta-"
+
+	["meta-"]="meta-"
+
+	["meta-O"]="meta2-"
+	["meta-["]="meta2-"
+	["meta2-"]="meta2-"
+
+	#xterm mouse reporting
+#	["meta2-M"]="mouse"
+
+	["meta2-A"]="Up"
+	["meta2-B"]="Down"
+	["meta2-C"]="Right"
+	["meta2-D"]="Left"
+	["meta2-F"]="End"
+	["meta2-H"]="Home"
+
+	["meta2-1"]="meta2-1"	["meta2-1~"]="Home"
+	["meta2-2"]="meta2-2"	["meta2-2~"]="Insert"
+	["meta2-3"]="meta2-3"	["meta2-3~"]="Delete"
+	["meta2-4"]="meta2-4"	["meta2-4~"]="End"
+	["meta2-5"]="meta2-5"	["meta2-5~"]="PageUp"
+	["meta2-6"]="meta2-6"	["meta2-6~"]="PageDown"
+
+	#Xterm R6
+	["meta2-P"]="F1"
+	["meta2-Q"]="F2"
+	["meta2-R"]="F3"
+	["meta2-S"]="F4"
+
+	#Linux
+	["meta2-["]="meta2-["
+	["meta2-[A"]="F1"
+	["meta2-[B"]="F2"
+	["meta2-[C"]="F3"
+	["meta2-[D"]="F4"
+	["meta2-[E"]="F5"
+
+	#ESC[n~
+	["meta2-1"]="meta2-1"
+	["meta2-11"]="meta2-11"	["meta2-11~"]="F1"
+	["meta2-12"]="meta2-12"	["meta2-12~"]="F2"
+	["meta2-13"]="meta2-13"	["meta2-13~"]="F3"
+	["meta2-14"]="meta2-14"	["meta2-14~"]="F4"
+	["meta2-15"]="meta2-15"	["meta2-15~"]="F5"
+	["meta2-17"]="meta2-17"	["meta2-17~"]="F6"
+	["meta2-18"]="meta2-18"	["meta2-18~"]="F7"
+	["meta2-19"]="meta2-19"	["meta2-19~"]="F8"
+	["meta2-20"]="meta2-20"	["meta2-20~"]="F9"
+	["meta2-21"]="meta2-21"	["meta2-21~"]="F10"
+	["meta2-23"]="meta2-23"	["meta2-23~"]="F11"
+	["meta2-24"]="meta2-24"	["meta2-24~"]="F12"
+
+	#fun
+	["w"]="w"
+	["wt"]="wt"
+	["wtf"]="what the FUCK!"
+
+	[$'\001']="C-a"	[$'\002']="C-b"	[$'\003']="C-c"	[$'\004']="C-d"
+	[$'\005']="C-e"	[$'\006']="C-f"	[$'\007']="C-g"	[$'\010']="C-h"
+	[$'\011']="C-i"	[$'\012']="C-j"	[$'\013']="C-k"	[$'\014']="C-l"
+	[$'\015']="C-m"	[$'\016']="C-n"	[$'\017']="C-o"	[$'\020']="C-p"
+	[$'\021']="C-q"	[$'\022']="C-r"	[$'\023']="C-s"	[$'\024']="C-t"
+	[$'\025']="C-u"	[$'\026']="C-v"	[$'\027']="C-w"	[$'\030']="C-x"
+	[$'\031']="C-y"	[$'\032']="C-z"	[$'\033']='C-['	[$'\034']='C-\'
+	[$'\035']='C-]'	[$'\036']='C-^'	[$'\037']='C-_'	[$'\177']='C-?'
+)
+
+handle_char() {
+	local ch=$1 k l matches=0 cmd
+
+	if [[ $ch ]]; then
+		#pretreat...needed for control characters, because i'm dumb....?
+		[[ ${key_bindings[$ch]} ]] && ch=${key_bindings[$ch]}
+	else
+		ch="C-@"	# NUL
+	fi
+
+	key_buf+=$ch
+	[[ ${key_bindings[${key_buf}]} ]] && key_buf=${key_bindings[${key_buf}]}
+
+	#this way we can handle time-out, i.e. just ESC
+	if [[ ${key_bindings[${key_buf}]} ]] && IFS= read -rs -t 1 -N 1 ch; then
+		handle_char "$ch"
+	else
+		case "$key_buf" in
+			'meta2-M')	handle_mouse;;
+			'meta-')	toggle_mouse;;
+			*)		printf 'U%s\n' "${key_buf}";;
+		esac
+		unset key_buf
+	fi
+}
+
+toggle_mouse() {
+	local status
+
+	((mouse_status = !mouse_status))
+	if ((mouse_status == 1)); then
+		printf '\e[?1000h'
+		status='mouse enabled'
+	else
+		printf '\e[?1000l'
+		status='mouse disabled'
+	fi
+	tput clear
+	tput setab 4
+	printf '%*s\n' "-$(tput cols)" "$status"
+	tput sgr0
+}
+
+handle_mouse() {
+	local button x y b enc
+
+	IFS= read -rs -N 3 enc
+
+	#convert char->dec
+	printf -v button '%d' "'${enc:0:1}"
+	printf -v y '%d' "'${enc:1:1}"
+	printf -v x '%d' "'${enc:2:1}"
+
+	#silly button bits
+	((button&4)) && b+='shift+'
+	((button&8)) && b+='meta+'
+	((button&16)) && b+='ctrl+'
+	case "$(( ((64 & button) >> 4) | (button & 3) ))" in
+		0) b+='button1';;
+		1) b+='button2';;
+		2) b+='button3';;
+		3) b+='release';;
+		4) b+='wheel-up';;
+		5) b+='wheel-down';;
+	esac
+
+	((x-=33,y-=33))
+	printf '%15s (%d,%d)\n' "$b" "$x" "$y"
 }
 
 thread_user() {
 	local ch
 
 	while IFS= read -s -N 1 -r ch; do
-		echo "U$ch"
+		handle_char "$ch"
 	done
 } >&3
 
